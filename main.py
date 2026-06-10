@@ -107,6 +107,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS library (
                 id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL DEFAULT 'legacy',
                 item_type TEXT NOT NULL,
                 title TEXT NOT NULL,
                 payload TEXT NOT NULL,
@@ -126,6 +127,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS payments (
                 id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL DEFAULT 'legacy',
                 provider TEXT NOT NULL,
                 plan TEXT NOT NULL,
                 days INTEGER NOT NULL,
@@ -138,6 +140,10 @@ def init_db() -> None:
             )
             """
         )
+        for table in ("library", "payments"):
+            cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "owner_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
         row = conn.execute("SELECT value FROM settings WHERE key='credits'").fetchone()
         if not row:
             conn.execute("INSERT INTO settings(key,value) VALUES('credits', ?)", (str(INITIAL_CREDITS),))
@@ -147,27 +153,49 @@ def init_db() -> None:
 init_db()
 
 
-def get_credits() -> int:
+DEFAULT_OWNER = "legacy"
+
+
+def clean_owner_id(value: str) -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9:_-]+", "", value)[:80]
+    return value or DEFAULT_OWNER
+
+
+def request_owner(request: Optional[Request] = None, owner_id: str = "") -> str:
+    if owner_id:
+        return clean_owner_id(owner_id)
+    if request is None:
+        return DEFAULT_OWNER
+    value = request.headers.get("x-user-key") or request.query_params.get("u") or ""
+    return clean_owner_id(value)
+
+
+def owner_setting_key(owner_id: str, key: str) -> str:
+    return f"user:{clean_owner_id(owner_id)}:{key}"
+
+
+def get_credits(owner_id: str = DEFAULT_OWNER) -> int:
     with db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key='credits'").fetchone()
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (owner_setting_key(owner_id, "credits"),)).fetchone()
         return int(row["value"]) if row else INITIAL_CREDITS
 
 
-def set_credits(value: int) -> None:
+def set_credits(value: int, owner_id: str = DEFAULT_OWNER) -> None:
     with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('credits', ?)", (str(max(0, value)),))
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?, ?)", (owner_setting_key(owner_id, "credits"), str(max(0, value))))
         conn.commit()
 
 
-def get_setting(key: str, default: str = "") -> str:
+def get_setting(key: str, default: str = "", owner_id: str = DEFAULT_OWNER) -> str:
     with db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (owner_setting_key(owner_id, key),)).fetchone()
     return str(row["value"]) if row else default
 
 
-def set_setting(key: str, value: str) -> None:
+def set_setting(key: str, value: str, owner_id: str = DEFAULT_OWNER) -> None:
     with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (owner_setting_key(owner_id, key), value))
         conn.commit()
 
 
@@ -213,19 +241,20 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-def activate_premium(days: int, plan: str) -> str:
-    current = premium_until()
+def activate_premium(days: int, plan: str, owner_id: str = DEFAULT_OWNER) -> str:
+    current = premium_until(owner_id)
     start = current if current and current > datetime.now() else datetime.now()
     until = start + timedelta(days=max(1, min(365, int(days))))
-    set_setting("premium_until", until.isoformat(timespec="seconds"))
-    set_setting("premium_plan", plan[:80])
+    set_setting("premium_until", until.isoformat(timespec="seconds"), owner_id)
+    set_setting("premium_plan", plan[:80], owner_id)
     return until.isoformat(timespec="seconds")
 
 
-def create_payment(provider: str, days: int, amount: int, plan: str) -> Dict[str, Any]:
+def create_payment(provider: str, days: int, amount: int, plan: str, owner_id: str = DEFAULT_OWNER) -> Dict[str, Any]:
     payment_id = str(uuid.uuid4())
     data = {
         "id": payment_id,
+        "owner_id": clean_owner_id(owner_id),
         "provider": provider,
         "plan": plan,
         "days": int(days),
@@ -239,11 +268,11 @@ def create_payment(provider: str, days: int, amount: int, plan: str) -> Dict[str
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO payments(id,provider,plan,days,amount,status,provider_transaction_id,payload,created_at,paid_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO payments(id,owner_id,provider,plan,days,amount,status,provider_transaction_id,payload,created_at,paid_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                data["id"], data["provider"], data["plan"], data["days"], data["amount"],
+                data["id"], data["owner_id"], data["provider"], data["plan"], data["days"], data["amount"],
                 data["status"], data["provider_transaction_id"], json.dumps(data["payload"]),
                 data["created_at"], data["paid_at"],
             ),
@@ -305,7 +334,8 @@ def mark_payment_paid(payment_id: str, provider_transaction_id: str = "", payloa
     if not payment:
         raise HTTPException(status_code=404, detail="Payment topilmadi")
     if payment["status"] != "paid":
-        until = activate_premium(int(payment["days"]), str(payment["plan"]))
+        owner_id = clean_owner_id(payment.get("owner_id") or DEFAULT_OWNER)
+        until = activate_premium(int(payment["days"]), str(payment["plan"]), owner_id)
         merged_payload = payment.get("payload") or {}
         if payload:
             merged_payload.update(payload)
@@ -319,7 +349,7 @@ def mark_payment_paid(payment_id: str, provider_transaction_id: str = "", payloa
             paid_at=now_iso(),
         )
     fresh = get_payment(payment_id) or payment
-    fresh["quota"] = quota_status()
+    fresh["quota"] = quota_status(clean_owner_id(fresh.get("owner_id") or DEFAULT_OWNER))
     return fresh
 
 
@@ -332,32 +362,33 @@ def parse_dt(value: str) -> Optional[datetime]:
         return None
 
 
-def get_int_setting(key: str, default: int) -> int:
+def get_int_setting(key: str, default: int, owner_id: str = DEFAULT_OWNER) -> int:
     try:
-        return int(get_setting(key, str(default)) or default)
+        return int(get_setting(key, str(default), owner_id) or default)
     except ValueError:
         return default
 
 
-def premium_until() -> Optional[datetime]:
-    return parse_dt(get_setting("premium_until"))
+def premium_until(owner_id: str = DEFAULT_OWNER) -> Optional[datetime]:
+    return parse_dt(get_setting("premium_until", owner_id=owner_id))
 
 
-def is_premium_active() -> bool:
-    until = premium_until()
+def is_premium_active(owner_id: str = DEFAULT_OWNER) -> bool:
+    until = premium_until(owner_id)
     return bool(until and until > datetime.now())
 
 
-def quota_status() -> Dict[str, Any]:
+def quota_status(owner_id: str = DEFAULT_OWNER) -> Dict[str, Any]:
     now = datetime.now()
-    until = premium_until()
+    owner_id = clean_owner_id(owner_id)
+    until = premium_until(owner_id)
     premium_active = bool(until and until > now)
-    cooldown = parse_dt(get_setting("free_cooldown_until"))
-    free_remaining = get_int_setting("free_remaining", FREE_STARTER_USES)
+    cooldown = parse_dt(get_setting("free_cooldown_until", owner_id=owner_id))
+    free_remaining = get_int_setting("free_remaining", FREE_STARTER_USES, owner_id)
     if not premium_active and free_remaining <= 0 and cooldown and cooldown <= now:
         free_remaining = 1
-        set_setting("free_remaining", "1")
-        set_setting("free_cooldown_until", "")
+        set_setting("free_remaining", "1", owner_id)
+        set_setting("free_cooldown_until", "", owner_id)
         cooldown = None
     can_generate = premium_active or free_remaining > 0
     return {
@@ -370,8 +401,8 @@ def quota_status() -> Dict[str, Any]:
     }
 
 
-def check_credit(amount: int = 1) -> None:
-    status = quota_status()
+def check_credit(amount: int = 1, owner_id: str = DEFAULT_OWNER) -> None:
+    status = quota_status(owner_id)
     if status["premium_active"] or status["free_remaining"] > 0:
         return None
     until = status.get("free_cooldown_until") or ""
@@ -381,21 +412,23 @@ def check_credit(amount: int = 1) -> None:
     )
 
 
-def deduct_credit(amount: int = 1) -> None:
-    if is_premium_active():
+def deduct_credit(amount: int = 1, owner_id: str = DEFAULT_OWNER) -> None:
+    owner_id = clean_owner_id(owner_id)
+    if is_premium_active(owner_id):
         return None
-    remaining = max(0, get_int_setting("free_remaining", FREE_STARTER_USES) - 1)
-    set_setting("free_remaining", str(remaining))
+    remaining = max(0, get_int_setting("free_remaining", FREE_STARTER_USES, owner_id) - 1)
+    set_setting("free_remaining", str(remaining), owner_id)
     if remaining <= 0:
         cooldown_until = datetime.now() + timedelta(days=FREE_COOLDOWN_DAYS)
-        set_setting("free_cooldown_until", cooldown_until.isoformat(timespec="seconds"))
+        set_setting("free_cooldown_until", cooldown_until.isoformat(timespec="seconds"), owner_id)
 
 
-def save_item(item_type: str, title: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def save_item(item_type: str, title: str, payload: Dict[str, Any], owner_id: str = DEFAULT_OWNER) -> Dict[str, Any]:
     item_id = str(uuid.uuid4())
     created_at = now_iso()
     data = {
         "id": item_id,
+        "owner_id": clean_owner_id(owner_id),
         "item_type": item_type,
         "title": title.strip()[:180] or "Untitled",
         "payload": payload,
@@ -403,8 +436,8 @@ def save_item(item_type: str, title: str, payload: Dict[str, Any]) -> Dict[str, 
     }
     with db() as conn:
         conn.execute(
-            "INSERT INTO library(id,item_type,title,payload,created_at) VALUES(?,?,?,?,?)",
-            (item_id, item_type, data["title"], json.dumps(payload, ensure_ascii=False), created_at),
+            "INSERT INTO library(id,owner_id,item_type,title,payload,created_at) VALUES(?,?,?,?,?,?)",
+            (item_id, data["owner_id"], item_type, data["title"], json.dumps(payload, ensure_ascii=False), created_at),
         )
         conn.commit()
     return data
@@ -413,6 +446,7 @@ def save_item(item_type: str, title: str, payload: Dict[str, Any]) -> Dict[str, 
 def row_to_item(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
+        "owner_id": row["owner_id"] if "owner_id" in row.keys() else DEFAULT_OWNER,
         "item_type": row["item_type"],
         "title": row["title"],
         "payload": json.loads(row["payload"]),
@@ -980,42 +1014,47 @@ def result_page(item_id: str) -> FileResponse:
 
 
 @app.get("/api/health")
-def health() -> Dict[str, Any]:
+def health(request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     return {
         "ok": True,
         "app": APP_NAME,
         "ai_provider": "Groq" if bool(GROQ_API_KEY) else "not_configured",
         "model": GROQ_MODEL,
-        "credits": get_credits(),
-        "quota": quota_status(),
+        "credits": get_credits(owner_id),
+        "quota": quota_status(owner_id),
         "message": "Groq ulangan" if GROQ_API_KEY else "Groq API key .env ichida yoвЂq",
     }
 
 
 @app.get("/api/credits")
-def credits() -> Dict[str, Any]:
-    return {"credits": get_credits()}
+def credits(request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
+    return {"credits": get_credits(owner_id)}
 
 
 @app.post("/api/topic-test")
-def topic_test(req: TopicTestRequest) -> Dict[str, Any]:
+def topic_test(req: TopicTestRequest, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     result = make_test_from_context(req.topic, req.topic, req.count, req.language, req.level, "topic")
-    deduct_credit(1)
-    item = save_item("test", result["title"], result)
-    return {"item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("test", result["title"], result, owner_id)
+    return {"item": item, "credits": get_credits(owner_id)}
 
 
 @app.post("/api/pdf-test")
 async def pdf_test(
+    request: Request,
     file: UploadFile = File(...),
     language: str = Form("uz"),
     count: int = Form(10),
     level: str = Form("medium"),
 ) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Faqat PDF fayl yuklang.")
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", file.filename)[:120]
@@ -1026,69 +1065,76 @@ async def pdf_test(
     title = Path(file.filename).stem
     result = make_test_from_context(title, text, max(3, min(50, count)), language, level, "pdf")
     result["filename"] = file.filename
-    deduct_credit(1)
-    item = save_item("test", result["title"], result)
-    return {"item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("test", result["title"], result, owner_id)
+    return {"item": item, "credits": get_credits(owner_id)}
 
 
 @app.post("/api/flashcards")
-def flashcards(req: FlashcardRequest) -> Dict[str, Any]:
+def flashcards(req: FlashcardRequest, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     source = clean_text(req.source)
     result = make_flashcards(source, req.count, req.language, req.level, req.source_type)
-    deduct_credit(1)
-    item = save_item("flashcards", result["title"], result)
-    return {"item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("flashcards", result["title"], result, owner_id)
+    return {"item": item, "credits": get_credits(owner_id)}
 
 
 @app.post("/api/flashcards-image")
 async def flashcards_image(
+    request: Request,
     file: UploadFile = File(...),
     language: str = Form("auto"),
     count: int = Form(0),
     level: str = Form("medium"),
 ) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     mime_type = file.content_type or ""
     if not mime_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Faqat rasm fayl yuklang.")
     image_bytes = await file.read()
     result = make_flashcards_from_image(image_bytes, mime_type, count, language, level)
-    deduct_credit(1)
-    item = save_item("flashcards", result["title"], result)
-    return {"item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("flashcards", result["title"], result, owner_id)
+    return {"item": item, "credits": get_credits(owner_id)}
 
 
 @app.get("/api/library")
-def library() -> Dict[str, Any]:
+def library(request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     with db() as conn:
-        rows = conn.execute("SELECT * FROM library ORDER BY created_at DESC LIMIT 200").fetchall()
-    return {"items": [row_to_item(r) for r in rows], "credits": get_credits()}
+        rows = conn.execute("SELECT * FROM library WHERE owner_id=? ORDER BY created_at DESC LIMIT 200", (owner_id,)).fetchall()
+    return {"items": [row_to_item(r) for r in rows], "credits": get_credits(owner_id)}
 
 
 @app.get("/api/item/{item_id}")
-def get_item(item_id: str) -> Dict[str, Any]:
+def get_item(item_id: str, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     with db() as conn:
-        row = conn.execute("SELECT * FROM library WHERE id=?", (item_id,)).fetchone()
+        row = conn.execute("SELECT * FROM library WHERE id=? AND owner_id=?", (item_id, owner_id)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Topilmadi")
     return {"item": row_to_item(row)}
 
 
 @app.delete("/api/item/{item_id}")
-def delete_item(item_id: str) -> Dict[str, Any]:
+def delete_item(item_id: str, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     with db() as conn:
-        conn.execute("DELETE FROM library WHERE id=?", (item_id,))
+        conn.execute("DELETE FROM library WHERE id=? AND owner_id=?", (item_id, owner_id))
         conn.commit()
     return {"ok": True}
 
 
 @app.get("/api/export/{item_id}.txt")
-def export_txt(item_id: str) -> PlainTextResponse:
+def export_txt(item_id: str, request: Request) -> PlainTextResponse:
+    owner_id = request_owner(request)
     with db() as conn:
-        row = conn.execute("SELECT * FROM library WHERE id=?", (item_id,)).fetchone()
+        row = conn.execute("SELECT * FROM library WHERE id=? AND owner_id=?", (item_id, owner_id)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Topilmadi")
     item = row_to_item(row)
@@ -1117,20 +1163,22 @@ def export_txt(item_id: str) -> PlainTextResponse:
 
 
 @app.post("/api/dev/add-credits")
-def add_credits(amount: int = 20) -> Dict[str, Any]:
+def add_credits(request: Request, amount: int = 20) -> Dict[str, Any]:
     # MVP helper. Later this route should be protected by admin/payment.
-    set_credits(get_credits() + max(1, min(500, amount)))
-    return {"credits": get_credits()}
+    owner_id = request_owner(request)
+    set_credits(get_credits(owner_id) + max(1, min(500, amount)), owner_id)
+    return {"credits": get_credits(owner_id)}
 
 
 @app.post("/api/premium/buy")
-def buy_premium(req: Dict[str, Any]) -> Dict[str, Any]:
+def buy_premium(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     days = max(1, min(365, int(req.get("days") or 7)))
     plan = str(req.get("plan") or f"{days} kun")[:80]
     provider = str(req.get("provider") or "click").lower()
     requested_amount = int(req.get("amount") or 0)
     amount = stars_amount(days, requested_amount) if provider == "stars" else plan_amount(days, requested_amount)
-    payment = create_payment(provider, days, amount, plan)
+    payment = create_payment(provider, days, amount, plan, owner_id)
     if provider == "payme":
         if not PAYME_MERCHANT_ID:
             raise HTTPException(status_code=400, detail="PAYME_MERCHANT_ID .env ichida yoвЂq")
@@ -1157,9 +1205,10 @@ def buy_premium(req: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.get("/api/payment/{payment_id}")
-def payment_status(payment_id: str) -> Dict[str, Any]:
+def payment_status(payment_id: str, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     payment = get_payment(payment_id)
-    if not payment:
+    if not payment or clean_owner_id(payment.get("owner_id") or DEFAULT_OWNER) != owner_id:
         raise HTTPException(status_code=404, detail="Payment topilmadi")
     return {
         "id": payment["id"],
@@ -1167,7 +1216,7 @@ def payment_status(payment_id: str) -> Dict[str, Any]:
         "status": payment["status"],
         "amount": payment["amount"],
         "paid_at": payment.get("paid_at") or "",
-        "quota": quota_status(),
+        "quota": quota_status(owner_id),
     }
 
 
@@ -1449,10 +1498,11 @@ def old_item_summary(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.get("/api/profile")
-def profile_old() -> Dict[str, Any]:
+def profile_old(request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     with db() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM library").fetchone()
-    quota = quota_status()
+        row = conn.execute("SELECT COUNT(*) AS c FROM library WHERE owner_id=?", (owner_id,)).fetchone()
+    quota = quota_status(owner_id)
     return {
         "username": "",
         "items": int(row["c"] if row else 0),
@@ -1471,20 +1521,22 @@ def add_credits_old(req: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.post("/api/generate/topic-test")
-def topic_test_old(req: TopicTestRequest) -> Dict[str, Any]:
+def topic_test_old(req: TopicTestRequest, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     result = make_test_from_context(req.topic, req.topic, req.count, req.language, req.level, "topic")
     result = normalize_old_payload(result)
-    deduct_credit(1)
-    item = save_item("test", result["title"], result)
-    return {"id": item["id"], "data": result, "item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("test", result["title"], result, owner_id)
+    return {"id": item["id"], "data": result, "item": item, "credits": get_credits(owner_id)}
 
 
 @app.post("/api/generate/flashcards")
-def flashcards_old(req: Dict[str, Any]) -> Dict[str, Any]:
+def flashcards_old(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     text = clean_text(str(req.get("text") or req.get("source") or ""))
     if len(text) < 2:
         raise HTTPException(status_code=400, detail="Matn yoki mavzu yozing")
@@ -1492,39 +1544,43 @@ def flashcards_old(req: Dict[str, Any]) -> Dict[str, Any]:
     count = int(req.get("count") or 10)
     level = str(req.get("level") or "medium")
     result = make_flashcards(text, max(3, min(50, count)), language, level, "topic/text")
-    deduct_credit(1)
-    item = save_item("flashcards", result["title"], result)
-    return {"id": item["id"], "data": result, "item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("flashcards", result["title"], result, owner_id)
+    return {"id": item["id"], "data": result, "item": item, "credits": get_credits(owner_id)}
 
 
 @app.post("/api/generate/flashcards-image")
 async def flashcards_image_old(
+    request: Request,
     file: UploadFile = File(...),
     language: str = Form("auto"),
     count: int = Form(0),
     level: str = Form("medium"),
 ) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     mime_type = file.content_type or ""
     if not mime_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Faqat rasm fayl yuklang.")
     image_bytes = await file.read()
     result = make_flashcards_from_image(image_bytes, mime_type, int(count or 0), language, level)
-    deduct_credit(1)
-    item = save_item("flashcards", result["title"], result)
-    return {"id": item["id"], "data": result, "item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("flashcards", result["title"], result, owner_id)
+    return {"id": item["id"], "data": result, "item": item, "credits": get_credits(owner_id)}
 
 
 @app.post("/api/generate/pdf-test")
 async def pdf_test_old(
+    request: Request,
     file: UploadFile = File(...),
     language: str = Form("uz"),
     count: int = Form(10),
     level: str = Form("medium"),
 ) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     ensure_groq_key()
-    check_credit(1)
+    check_credit(1, owner_id)
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Faqat PDF fayl yuklang.")
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", file.filename)[:120]
@@ -1535,24 +1591,26 @@ async def pdf_test_old(
     result = make_test_from_context(Path(file.filename).stem, text, max(3, min(50, count)), language, level, "pdf")
     result["filename"] = file.filename
     result = normalize_old_payload(result)
-    deduct_credit(1)
-    item = save_item("test", result["title"], result)
-    return {"id": item["id"], "data": result, "item": item, "credits": get_credits()}
+    deduct_credit(1, owner_id)
+    item = save_item("test", result["title"], result, owner_id)
+    return {"id": item["id"], "data": result, "item": item, "credits": get_credits(owner_id)}
 
 
 # Override old UI library shape. This route is intentionally defined after the core /api/library in code order.
 @app.get("/api/library/old")
-def library_old_explicit() -> Dict[str, Any]:
+def library_old_explicit(request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     with db() as conn:
-        rows = conn.execute("SELECT * FROM library ORDER BY created_at DESC LIMIT 200").fetchall()
+        rows = conn.execute("SELECT * FROM library WHERE owner_id=? ORDER BY created_at DESC LIMIT 200", (owner_id,)).fetchall()
     items = [old_item_summary(row_to_item(r)) for r in rows]
-    return {"items": items, "credits": get_credits()}
+    return {"items": items, "credits": get_credits(owner_id)}
 
 
 @app.get("/api/item/old/{item_id}")
-def get_item_old_explicit(item_id: str) -> Dict[str, Any]:
+def get_item_old_explicit(item_id: str, request: Request) -> Dict[str, Any]:
+    owner_id = request_owner(request)
     with db() as conn:
-        row = conn.execute("SELECT * FROM library WHERE id=?", (item_id,)).fetchone()
+        row = conn.execute("SELECT * FROM library WHERE id=? AND owner_id=?", (item_id, owner_id)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Topilmadi")
     item = row_to_item(row)
@@ -1561,8 +1619,8 @@ def get_item_old_explicit(item_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/export/txt/{item_id}")
-def export_txt_old(item_id: str):
-    return export_txt(item_id)
+def export_txt_old(item_id: str, request: Request):
+    return export_txt(item_id, request)
 
 
 @app.exception_handler(HTTPException)
