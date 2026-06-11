@@ -1,0 +1,17 @@
+.env
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+data/
+uploads/
+*.log
+uvicorn_*.log
+uvicorn_*.err.log
+.venv/
+venv/
+env/
+.pytest_cache/
+node_modules/
+.firebase/
+.firebaserc

@@ -30,6 +30,24 @@ Telegram Stars:
 - Webhook ulash uchun server ishga tushgandan keyin POST yuboring: https://sizning-domen.uz/api/telegram/set-webhook
 - Telegram Stars invoice currency: XTR. Provider token kerak emas.
 
+Firebase + Cloud Run deploy:
+1) Firebase project yarating va Blaze billing yoqing.
+2) Google Cloud CLI bilan login qiling:
+   gcloud auth login
+   gcloud config set project FIREBASE_PROJECT_ID
+3) Cloud Run backend deploy:
+   gcloud run deploy quizuzum --source . --region us-central1 --allow-unauthenticated
+4) Cloud Run URL chiqqandan keyin envlarni qo'ying:
+   gcloud run services update quizuzum --region us-central1 --set-env-vars APP_NAME=QuizUzum,PUBLIC_BASE_URL=https://FIREBASE_DOMAIN,TELEGRAM_WEBAPP_URL=https://FIREBASE_DOMAIN,GROQ_MODEL=llama-3.3-70b-versatile,GROQ_VISION_MODEL=meta-llama/llama-4-scout-17b-16e-instruct,GROQ_BASE_URL=https://api.groq.com/openai/v1,INITIAL_CREDITS=30,MAX_CONTEXT_CHARS=14000,REQUEST_TIMEOUT=90,TELEGRAM_STARS_1=15,TELEGRAM_STARS_7=60,TELEGRAM_STARS_30=110,TELEGRAM_STARS_TEACHER=160
+5) Maxfiy kalitlarni Cloud Run Environment variables ichida alohida qo'ying:
+   GROQ_API_KEY
+   TELEGRAM_BOT_TOKEN
+6) Firebase Hosting deploy:
+   firebase init hosting
+   firebase deploy --only hosting
+7) Webhook:
+   https://FIREBASE_DOMAIN/api/telegram/set-webhook
+
 Yangi interfeys:
 - Chap studio navigatsiya
 - PDF, mavzu va kartochka generatorlari bitta workspace ichida
