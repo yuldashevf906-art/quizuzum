@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import hashlib
 import json
 import os
@@ -239,6 +239,16 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=f"Telegram API xatosi: {data}")
     return data
+
+
+def set_telegram_menu_button() -> Dict[str, Any]:
+    return telegram_api("setChatMenuButton", {
+        "menu_button": {
+            "type": "web_app",
+            "text": "Ochish",
+            "web_app": {"url": TELEGRAM_WEBAPP_URL},
+        }
+    })
 
 
 def activate_premium(days: int, plan: str, owner_id: str = DEFAULT_OWNER) -> str:
@@ -1261,8 +1271,23 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
 @app.get("/api/telegram/set-webhook")
 @app.post("/api/telegram/set-webhook")
 def telegram_set_webhook() -> Dict[str, Any]:
-    result = telegram_api("setWebhook", {"url": f"{PUBLIC_BASE_URL}/api/telegram/webhook"})
-    return {"ok": True, "result": result.get("result"), "url": f"{PUBLIC_BASE_URL}/api/telegram/webhook"}
+    webhook_url = f"{PUBLIC_BASE_URL}/api/telegram/webhook"
+    webhook_result = telegram_api("setWebhook", {"url": webhook_url})
+    menu_result = set_telegram_menu_button()
+    return {
+        "ok": True,
+        "webhook": webhook_result.get("result"),
+        "menu_button": menu_result.get("result"),
+        "url": webhook_url,
+        "webapp_url": TELEGRAM_WEBAPP_URL,
+    }
+
+
+@app.get("/api/telegram/set-menu-button")
+@app.post("/api/telegram/set-menu-button")
+def telegram_set_menu_button() -> Dict[str, Any]:
+    result = set_telegram_menu_button()
+    return {"ok": True, "result": result.get("result"), "webapp_url": TELEGRAM_WEBAPP_URL}
 
 
 @app.get("/api/telegram/webhook-info")
@@ -1629,13 +1654,9 @@ def http_error_handler(request, exc: HTTPException):
 
 
 if __name__ == "__main__":
-    import threading
-    import webbrowser
-
     import uvicorn
 
     url = "http://127.0.0.1:8010"
     print(f"Testchi AI ishga tushdi: {url}")
-    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     uvicorn.run("main:app", host="127.0.0.1", port=8010, reload=False)
 
