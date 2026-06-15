@@ -7,7 +7,7 @@ import sqlite3
 import textwrap
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
@@ -53,10 +53,9 @@ CLICK_SECRET_KEY = os.getenv("CLICK_SECRET_KEY", "").strip()
 CLICK_PAY_URL = os.getenv("CLICK_PAY_URL", "https://my.click.uz/services/pay").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBAPP_URL = os.getenv("TELEGRAM_WEBAPP_URL", PUBLIC_BASE_URL).rstrip("/")
-TELEGRAM_STARS_1 = int(os.getenv("TELEGRAM_STARS_1", "15"))
-TELEGRAM_STARS_7 = int(os.getenv("TELEGRAM_STARS_7", "60"))
-TELEGRAM_STARS_30 = int(os.getenv("TELEGRAM_STARS_30", "110"))
-TELEGRAM_STARS_TEACHER = int(os.getenv("TELEGRAM_STARS_TEACHER", "160"))
+TELEGRAM_STARS_1 = 40
+TELEGRAM_STARS_7 = 140
+TELEGRAM_STARS_30 = 250
 
 app = FastAPI(title=APP_NAME, version="3.0.0")
 app.add_middleware(
@@ -200,9 +199,9 @@ def set_setting(key: str, value: str, owner_id: str = DEFAULT_OWNER) -> None:
 
 
 PLAN_PRICES = {
-    1: 9900,
-    7: 39000,
-    30: 69000,
+    1: 6900,
+    7: 24900,
+    30: 44900,
 }
 
 
@@ -210,18 +209,40 @@ def plan_amount(days: int, requested_amount: Optional[int] = None) -> int:
     days = int(days)
     if requested_amount and requested_amount > 0:
         return int(requested_amount)
-    return PLAN_PRICES.get(days, 69000 if days >= 30 else 39000)
+    return PLAN_PRICES.get(days, 44900 if days >= 30 else 24900)
 
 
 def stars_amount(days: int, requested_amount: Optional[int] = None) -> int:
-    amount = int(requested_amount or 0)
-    if amount >= 99000:
-        return TELEGRAM_STARS_TEACHER
     if int(days) >= 30:
         return TELEGRAM_STARS_30
     if int(days) >= 7:
         return TELEGRAM_STARS_7
     return TELEGRAM_STARS_1
+
+
+def today_paid_counts() -> Dict[str, int]:
+    now_utc = datetime.now(timezone.utc)
+    tashkent = timezone(timedelta(hours=5))
+    local_now = now_utc.astimezone(tashkent)
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = local_start.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+    end_utc = (local_start + timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+    counts = {"1": 0, "7": 0, "30": 0}
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT days, COUNT(DISTINCT owner_id) AS c
+            FROM payments
+            WHERE status='paid' AND paid_at>=? AND paid_at<?
+            GROUP BY days
+            """,
+            (start_utc, end_utc),
+        ).fetchall()
+    for row in rows:
+        days = str(int(row["days"]))
+        if days in counts:
+            counts[days] = int(row["c"])
+    return counts
 
 
 def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -624,7 +645,9 @@ CRITICAL RULES:
 - If the source is an existing test PDF, rewrite it cleanly: one question + four clean options. Do not mix several questions together.
 - Questions must be clear, useful and specific: facts, definitions, causes, results, comparisons, examples, dates, formulas or key concepts.
 - Wrong options must be plausible, same category as the right option, and not silly/random.
-- Uzbek output must be natural Uzbek Latin. Russian output must be Russian. English output must be English.
+- The requested output language is mandatory for EVERY generated field: title, summary, questions, options and explanations.
+- Uzbek output must be natural Uzbek Latin only. Russian output must be Russian only. English output must be English only.
+- Never mix Uzbek, Russian and English in one result. If the source language differs, translate the generated result into the requested language.
 - Exactly 4 options per question.
 - correct_index must be 0, 1, 2 or 3.
 - Explanation must briefly explain why the correct answer is correct.
@@ -637,7 +660,9 @@ Cards must be useful for memorization. Each card has front question/term, back a
 If the input is only a topic, expand it using reliable school-level/general educational knowledge.
 Front side must be one short term or one direct question. Back side must be a clear answer in 1-3 short sentences.
 Do not make vague cards such as "Bu mavzu nima haqida?".
-Uzbek output must be natural Uzbek Latin. Russian output must be Russian. English output must be English.
+The requested output language is mandatory for every field: title, front, back, hint and tag.
+Uzbek output must be natural Uzbek Latin only. Russian output must be Russian only. English output must be English only.
+Never mix Uzbek, Russian and English in one result. Translate source content when needed.
 """.strip()
 
 
@@ -731,6 +756,7 @@ def normalize_questions(raw_questions: Any, count: int) -> List[Dict[str, Any]]:
     return cleaned
 
 def make_test_from_context(title: str, context: str, count: int, language: str, level: str, source: str) -> Dict[str, Any]:
+    language = language if language in {"uz", "ru", "en"} else "uz"
     count = max(3, min(50, int(count)))
     context = clean_text(context)
     level_policy = {
@@ -887,6 +913,7 @@ def normalize_image_cards(data: Dict[str, Any], count: int) -> List[Dict[str, An
 
 
 def make_flashcards(source_text: str, count: int, language: str, level: str, source_type: str) -> Dict[str, Any]:
+    language = language if language in {"uz", "ru", "en"} else "uz"
     count = max(3, min(50, int(count)))
     source_text = clean_text(source_text)
     source_policy = (
@@ -952,6 +979,7 @@ Return this exact JSON shape:
 
 
 def make_flashcards_from_image(image_bytes: bytes, mime_type: str, count: int, language: str, level: str) -> Dict[str, Any]:
+    language = language if language in {"auto", "uz", "ru", "en"} else "uz"
     requested_count = int(count or 0)
     auto_count = requested_count <= 0
     count = 50 if auto_count else max(3, min(50, requested_count))
@@ -1196,9 +1224,14 @@ def buy_premium(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
         encoded_payload = quote(base64.b64encode(payload.encode()).decode(), safe="")
         pay_url = f"{PAYME_CHECKOUT_URL}/{encoded_payload}"
     elif provider == "stars":
+        language = request.headers.get("x-app-language", "uz").lower()
+        description = {
+            "ru": "Возможности Testchi AI Premium",
+            "en": "Testchi AI Premium features",
+        }.get(language, "Testchi AI Premium imkoniyatlari")
         result = telegram_api("createInvoiceLink", {
             "title": f"Premium - {plan}",
-            "description": "Testchi AI Premium imkoniyatlari",
+            "description": description,
             "payload": payment["id"],
             "currency": "XTR",
             "prices": [{"label": plan, "amount": amount}],
@@ -1537,12 +1570,13 @@ def profile_old(request: Request) -> Dict[str, Any]:
         "free_remaining": quota["free_remaining"],
         "free_cooldown_until": quota["free_cooldown_until"],
         "can_generate": quota["can_generate"],
+        "purchases_today": today_paid_counts(),
     }
 
 
 @app.post("/api/credits/add")
 def add_credits_old(req: Dict[str, Any]) -> Dict[str, Any]:
-    raise HTTPException(status_code=410, detail="Kredit tizimi o'chirilgan. Premium Click/Payme orqali ulanadi.")
+    raise HTTPException(status_code=410, detail="Kredit tizimi o'chirilgan. Premium Telegram Stars orqali ulanadi.")
 
 
 @app.post("/api/generate/topic-test")
@@ -1656,7 +1690,9 @@ def http_error_handler(request, exc: HTTPException):
 if __name__ == "__main__":
     import uvicorn
 
-    url = "http://127.0.0.1:8010"
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8010"))
+    url = f"http://127.0.0.1:{port}"
     print(f"Testchi AI ishga tushdi: {url}")
-    uvicorn.run("main:app", host="127.0.0.1", port=8010, reload=False)
+    uvicorn.run("main:app", host=host, port=port, reload=False)
 
