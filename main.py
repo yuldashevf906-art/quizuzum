@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -10,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 
 import fitz  # PyMuPDF
 import requests
@@ -53,6 +54,11 @@ CLICK_SECRET_KEY = os.getenv("CLICK_SECRET_KEY", "").strip()
 CLICK_PAY_URL = os.getenv("CLICK_PAY_URL", "https://my.click.uz/services/pay").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBAPP_URL = os.getenv("TELEGRAM_WEBAPP_URL", PUBLIC_BASE_URL).rstrip("/")
+TELEGRAM_WEBHOOK_SECRET = os.getenv(
+    "TELEGRAM_WEBHOOK_SECRET",
+    hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()[:32] if TELEGRAM_BOT_TOKEN else "",
+).strip()
+TELEGRAM_AUTH_MAX_AGE = int(os.getenv("TELEGRAM_AUTH_MAX_AGE", str(7 * 24 * 60 * 60)))
 TELEGRAM_STARS_1 = 40
 TELEGRAM_STARS_7 = 140
 TELEGRAM_STARS_30 = 250
@@ -161,13 +167,43 @@ def clean_owner_id(value: str) -> str:
     return value or DEFAULT_OWNER
 
 
+def verify_telegram_init_data(init_data: str) -> Dict[str, Any]:
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN serverda sozlanmagan")
+    init_data = str(init_data or "").strip()
+    if not init_data:
+        raise HTTPException(status_code=401, detail="Platformaga faqat Telegram orqali kiring")
+    params = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = str(params.pop("hash", ""))
+    if not received_hash:
+        raise HTTPException(status_code=401, detail="Telegram imzosi topilmadi")
+    data_check = "\n".join(f"{key}={params[key]}" for key in sorted(params))
+    secret = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calculated = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calculated, received_hash):
+        raise HTTPException(status_code=401, detail="Telegram imzosi noto'g'ri")
+    try:
+        auth_date = int(params.get("auth_date") or 0)
+    except ValueError:
+        auth_date = 0
+    if auth_date and time.time() - auth_date > TELEGRAM_AUTH_MAX_AGE:
+        raise HTTPException(status_code=401, detail="Telegram sessiyasi eskirgan. Qayta oching")
+    try:
+        user = json.loads(params.get("user") or "{}")
+    except json.JSONDecodeError:
+        user = {}
+    if not user.get("id"):
+        raise HTTPException(status_code=401, detail="Telegram foydalanuvchi aniqlanmadi")
+    return {"params": params, "user": user}
+
+
 def request_owner(request: Optional[Request] = None, owner_id: str = "") -> str:
     if owner_id:
         return clean_owner_id(owner_id)
     if request is None:
         return DEFAULT_OWNER
-    value = request.headers.get("x-user-key") or request.query_params.get("u") or ""
-    return clean_owner_id(value)
+    auth = verify_telegram_init_data(request.headers.get("x-telegram-init-data") or "")
+    return clean_owner_id(f"tg:{auth['user']['id']}")
 
 
 def owner_setting_key(owner_id: str, key: str) -> str:
@@ -1053,14 +1089,20 @@ def result_page(item_id: str) -> FileResponse:
 
 @app.get("/api/health")
 def health(request: Request) -> Dict[str, Any]:
-    owner_id = request_owner(request)
+    try:
+        owner_id = request_owner(request)
+        credits = get_credits(owner_id)
+        quota = quota_status(owner_id)
+    except HTTPException:
+        credits = 0
+        quota = {}
     return {
         "ok": True,
         "app": APP_NAME,
         "ai_provider": "Groq" if bool(GROQ_API_KEY) else "not_configured",
         "model": GROQ_MODEL,
-        "credits": get_credits(owner_id),
-        "quota": quota_status(owner_id),
+        "credits": credits,
+        "quota": quota,
         "message": "Groq ulangan" if GROQ_API_KEY else "Groq API key .env ichida yoвЂq",
     }
 
@@ -1265,6 +1307,8 @@ def payment_status(payment_id: str, request: Request) -> Dict[str, Any]:
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request) -> Dict[str, Any]:
+    if TELEGRAM_WEBHOOK_SECRET and request.headers.get("x-telegram-bot-api-secret-token") != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Webhook secret noto'g'ri")
     update = await request.json()
     pre_checkout = update.get("pre_checkout_query")
     if pre_checkout:
@@ -1305,7 +1349,10 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
 @app.post("/api/telegram/set-webhook")
 def telegram_set_webhook() -> Dict[str, Any]:
     webhook_url = f"{PUBLIC_BASE_URL}/api/telegram/webhook"
-    webhook_result = telegram_api("setWebhook", {"url": webhook_url})
+    payload = {"url": webhook_url}
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    webhook_result = telegram_api("setWebhook", payload)
     menu_result = set_telegram_menu_button()
     return {
         "ok": True,
@@ -1330,9 +1377,12 @@ def telegram_webhook_info() -> Dict[str, Any]:
 
 
 @app.post("/api/telegram/profile")
-def telegram_profile(req: Dict[str, Any]) -> Dict[str, Any]:
+def telegram_profile(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    auth = verify_telegram_init_data(request.headers.get("x-telegram-init-data") or "")
     user = req.get("user") or {}
     user_id = str(user.get("id") or "")
+    if user_id != str(auth["user"].get("id") or ""):
+        raise HTTPException(status_code=403, detail="Telegram profil mos kelmadi")
     name = str(user.get("username") or " ".join(str(user.get(k) or "") for k in ("first_name", "last_name")).strip() or "Telegram user")
     photo_url = str(user.get("photo_url") or "")
     if user_id and TELEGRAM_BOT_TOKEN and not photo_url:
@@ -1571,6 +1621,23 @@ def profile_old(request: Request) -> Dict[str, Any]:
         "free_cooldown_until": quota["free_cooldown_until"],
         "can_generate": quota["can_generate"],
         "purchases_today": today_paid_counts(),
+    }
+
+
+@app.post("/api/superfocus/start")
+def superfocus_start(request: Request, req: Dict[str, Any]) -> Dict[str, Any]:
+    owner_id = request_owner(request)
+    if not is_premium_active(owner_id):
+        raise HTTPException(status_code=403, detail="SuperFocus faqat Premium tarifda ishlaydi")
+    minutes = max(5, min(120, int(req.get("minutes") or 25)))
+    started_at = now_iso()
+    set_setting("superfocus_started_at", started_at, owner_id)
+    set_setting("superfocus_minutes", str(minutes), owner_id)
+    return {
+        "ok": True,
+        "started_at": started_at,
+        "minutes": minutes,
+        "message": "SuperFocus boshlandi",
     }
 
 
