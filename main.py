@@ -145,6 +145,19 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS superfocus_sessions (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                minutes INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+            """
+        )
         for table in ("library", "payments"):
             cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if "owner_id" not in cols:
@@ -465,6 +478,48 @@ def quota_status(owner_id: str = DEFAULT_OWNER) -> Dict[str, Any]:
         "free_remaining": max(0, free_remaining),
         "free_cooldown_until": cooldown.isoformat(timespec="seconds") if cooldown else "",
         "can_generate": can_generate,
+    }
+
+
+def superfocus_stats(owner_id: str = DEFAULT_OWNER) -> Dict[str, Any]:
+    owner_id = clean_owner_id(owner_id)
+    today = datetime.now().date().isoformat()
+    with db() as conn:
+        today_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(minutes),0) AS m, COUNT(*) AS c
+            FROM superfocus_sessions
+            WHERE owner_id=? AND status='finished' AND substr(started_at,1,10)=?
+            """,
+            (owner_id, today),
+        ).fetchone()
+        total_row = conn.execute(
+            "SELECT COALESCE(SUM(minutes),0) AS m, COUNT(*) AS c FROM superfocus_sessions WHERE owner_id=? AND status='finished'",
+            (owner_id,),
+        ).fetchone()
+        day_rows = conn.execute(
+            """
+            SELECT substr(started_at,1,10) AS d
+            FROM superfocus_sessions
+            WHERE owner_id=? AND status='finished'
+            GROUP BY d
+            ORDER BY d DESC
+            LIMIT 90
+            """,
+            (owner_id,),
+        ).fetchall()
+    days = {row["d"] for row in day_rows}
+    streak = 0
+    cursor = datetime.now().date()
+    while cursor.isoformat() in days:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return {
+        "today_minutes": int(today_row["m"] if today_row else 0),
+        "today_sessions": int(today_row["c"] if today_row else 0),
+        "total_minutes": int(total_row["m"] if total_row else 0),
+        "total_sessions": int(total_row["c"] if total_row else 0),
+        "streak_days": streak,
     }
 
 
@@ -1621,6 +1676,7 @@ def profile_old(request: Request) -> Dict[str, Any]:
         "free_cooldown_until": quota["free_cooldown_until"],
         "can_generate": quota["can_generate"],
         "purchases_today": today_paid_counts(),
+        "superfocus": superfocus_stats(owner_id),
     }
 
 
@@ -1630,15 +1686,49 @@ def superfocus_start(request: Request, req: Dict[str, Any]) -> Dict[str, Any]:
     if not is_premium_active(owner_id):
         raise HTTPException(status_code=403, detail="SuperFocus faqat Premium tarifda ishlaydi")
     minutes = max(5, min(120, int(req.get("minutes") or 25)))
+    goal = clean_text(str(req.get("goal") or ""))[:180] or "Focus session"
     started_at = now_iso()
+    session_id = str(uuid.uuid4())
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO superfocus_sessions(id,owner_id,goal,minutes,status,started_at,finished_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (session_id, owner_id, goal, minutes, "active", started_at, ""),
+        )
+        conn.commit()
     set_setting("superfocus_started_at", started_at, owner_id)
     set_setting("superfocus_minutes", str(minutes), owner_id)
     return {
         "ok": True,
+        "id": session_id,
         "started_at": started_at,
         "minutes": minutes,
+        "goal": goal,
+        "stats": superfocus_stats(owner_id),
         "message": "SuperFocus boshlandi",
     }
+
+
+@app.post("/api/superfocus/finish")
+def superfocus_finish(request: Request, req: Dict[str, Any]) -> Dict[str, Any]:
+    owner_id = request_owner(request)
+    session_id = str(req.get("id") or "")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM superfocus_sessions WHERE id=? AND owner_id=?",
+            (session_id, owner_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="SuperFocus sessiyasi topilmadi")
+        if row["status"] != "finished":
+            conn.execute(
+                "UPDATE superfocus_sessions SET status='finished', finished_at=? WHERE id=? AND owner_id=?",
+                (now_iso(), session_id, owner_id),
+            )
+            conn.commit()
+    return {"ok": True, "stats": superfocus_stats(owner_id)}
 
 
 @app.post("/api/credits/add")
